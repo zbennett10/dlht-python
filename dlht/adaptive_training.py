@@ -121,7 +121,7 @@ class TrainingConfig:
     enable_volume_trigger: bool = True
     min_keys_for_training: int = 100  # Don't train with too few keys
     new_keys_trigger_count: int = 1000  # Retrain after N new keys
-    new_keys_trigger_percent: float = 0.1  # Or after X% growth
+    new_keys_trigger_percent: float = 0.4  # Or after 40% growth (per LEAD paper Section IV-C10)
 
     # Time-based triggers
     enable_staleness_trigger: bool = True
