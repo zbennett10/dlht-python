@@ -1,0 +1,25 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.pyc
+
+# Virtual environments
+venv/
+env/
+
+# Editor/IDE specific files
+.idea/
+.vscode/
+
+# Log files and temporary files
+*.log
+*.tmp
+
+# Sensitive information
+.env
+config.ini
+
+# Build artifacts
+build/
+dist/
+
+dlht.egg-info/
