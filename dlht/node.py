@@ -16,6 +16,7 @@ from collections import defaultdict
 from .config import LEADConfig
 from .models import RecursiveModelIndex
 from .adaptive_training import AdaptiveTrainingManager, TrainingConfig, federated_average_models
+from .federated_model import FederatedRecursiveModel, FederatedUpdateMessage, LeafModelParameters
 from .peer import LEADPeer, FingerEntry, KeyValuePair
 from .utils import peer_hash, distance, RPCMessage
 from .exceptions import NetworkException, RPCException, NodeNotReadyException
@@ -60,9 +61,21 @@ class LEADNode:
             enable_staleness_trigger=True,
             max_staleness_hours=24.0,
             new_keys_trigger_count=1000,
-            new_keys_trigger_percent=0.1,
+            new_keys_trigger_percent=self.config.model_update_threshold,
             reservoir_sample_size=10000
         ))
+
+        # Federated Recursive Model for decentralized training
+        self.frm = FederatedRecursiveModel(
+            num_leaf_models=self.config.branching_factor,
+            model_type=self.config.model_type,
+            update_threshold=self.config.model_update_threshold,
+            neighbor_ready_threshold=0.9  # 90% per LEAD paper Section III-E3
+        )
+
+        # Neighbor status tracking for FRM coordination
+        self.neighbor_ready_status: Dict[str, bool] = {}
+        self.neighbor_status_lock = threading.RLock()
 
         # Routing table: Maps tip_hash -> list of entities (CDC-populated)
         # Multiple entities can have the same hash, so we store a list per hash
@@ -337,7 +350,7 @@ class LEADNode:
             elif msg_type == 'request_keys':
                 vnode_vid = payload['vnode_vid']
                 new_node_vid = payload['new_node_vid']
-                
+
                 if vnode_vid in self.virtual_nodes:
                     vnode = self.virtual_nodes[vnode_vid]
                     pred_vid = vnode.predecessor.vid if vnode.predecessor else 0
@@ -346,9 +359,60 @@ class LEADNode:
                         'success': True,
                         'keys': [(kv.key, kv.value) for kv in keys]
                     }
-                    
+
                 return {'success': False}
-                
+
+            elif msg_type == 'get_frm_parameters':
+                # Return FRM leaf parameters for federated aggregation
+                leaf_params = [param.to_dict() for param in self.frm.get_leaf_parameters()]
+                return {
+                    'success': True,
+                    'sender_id': f"{self.ip}:{self.base_port}",
+                    'model_version': self.frm.model_version,
+                    'leaf_parameters': leaf_params,
+                    'total_keys_trained': sum(param.num_samples for param in self.frm.get_leaf_parameters())
+                }
+
+            elif msg_type == 'heartbeat':
+                # Heartbeat for neighbor coordination
+                sender_id = payload.get('sender_id')
+                update_ready = payload.get('update_ready', False)
+
+                # Update neighbor status
+                if sender_id:
+                    with self.neighbor_status_lock:
+                        self.neighbor_ready_status[sender_id] = update_ready
+
+                # Return our status
+                return {
+                    'success': True,
+                    'update_ready': self.frm.local_ready,
+                    'model_version': self.frm.model_version
+                }
+
+            elif msg_type == 'broadcast_model':
+                # Receive broadcasted model update from coordinator
+                model_version = payload.get('model_version')
+                leaf_parameters = payload.get('leaf_parameters', [])
+
+                # Convert dictionaries back to LeafModelParameters
+                params = [LeafModelParameters.from_dict(p) for p in leaf_parameters]
+
+                # Apply if version is newer
+                if model_version > self.learned_hash.version:
+                    try:
+                        self._apply_frm_to_learned_hash(params)
+                        with self.learned_hash_lock:
+                            self.learned_hash.version = model_version
+                        logger.info(f"Applied broadcasted model update to version {model_version}")
+                        return {'success': True, 'applied': True}
+                    except Exception as e:
+                        logger.error(f"Failed to apply broadcasted model: {e}")
+                        return {'success': False, 'error': str(e)}
+                else:
+                    logger.debug(f"Ignoring broadcasted model (version {model_version} <= current {self.learned_hash.version})")
+                    return {'success': True, 'applied': False}
+
             else:
                 return {'success': False, 'error': 'Unknown message type'}
                 
@@ -372,15 +436,52 @@ class LEADNode:
         
     def _stabilize_loop(self):
         """Periodic stabilization loop"""
+        heartbeat_counter = 0
+        heartbeat_interval = 5  # Send heartbeats every 5 stabilization cycles
+
         while self.running:
             try:
+                # Standard Chord stabilization
                 for vnode in self.virtual_nodes.values():
                     vnode.stabilize()
                     vnode.update_finger_table()
-                    
+
+                # Periodic heartbeat for FRM coordination
+                heartbeat_counter += 1
+                if heartbeat_counter >= heartbeat_interval:
+                    self._send_heartbeats_to_neighbors()
+                    heartbeat_counter = 0
+
+                # Check if we should trigger federated update
+                self.federated_model_update()
+
                 time.sleep(self.stabilize_interval)
             except Exception as e:
                 logger.error(f"Stabilization error: {e}")
+
+    def _send_heartbeats_to_neighbors(self):
+        """Send heartbeats to neighbors to coordinate FRM updates"""
+        # Get unique neighbor nodes
+        neighbor_nodes = set()
+        for vnode in self.virtual_nodes.values():
+            with vnode.lock:
+                if vnode.successor and vnode.successor.vid != vnode.vid:
+                    neighbor_nodes.add((vnode.successor.ip, vnode.successor.port))
+                if vnode.predecessor and vnode.predecessor.vid != vnode.vid:
+                    neighbor_nodes.add((vnode.predecessor.ip, vnode.predecessor.port))
+
+        # Send heartbeat to each neighbor
+        for ip, port in neighbor_nodes:
+            # Skip self
+            if ip == self.ip and port == self.base_port:
+                continue
+
+            status = self.rpc_heartbeat(ip, port)
+            if status:
+                neighbor_id = f"{ip}:{port}"
+                with self.neighbor_status_lock:
+                    self.neighbor_ready_status[neighbor_id] = status['update_ready']
+                logger.debug(f"Heartbeat: {neighbor_id} ready={status['update_ready']}")
                 
     # ========================================================================
     # PUBLIC API
@@ -592,90 +693,227 @@ class LEADNode:
 
             logger.info(f"✓ Model retrained: version {self.learned_hash.version}, "
                        f"{len(sample_keys)} keys, reason: {reason}") 
-    # def retrain_model(self, sample_keys: Optional[np.ndarray] = None):
-    #     """
-    #     Retrain the learned hash function
-        
-    #     Args:
-    #         sample_keys: Optional array of keys to train on. 
-    #                     If None, collects keys from all virtual nodes
-    #     """
-    #     with self.learned_hash_lock:
-    #         if sample_keys is None:
-    #             # Collect keys from all virtual nodes
-    #             all_keys = []
-    #             for vnode in self.virtual_nodes.values():
-    #                 with vnode.lock:
-    #                     all_keys.extend(vnode.storage.keys())
-                        
-    #             if not all_keys:
-    #                 logger.warning("No keys to train model on")
-    #                 return
-                    
-    #             sample_keys = np.array(sorted(all_keys))
-                
-    #         self.learned_hash.train(sample_keys)
-            
-    #         # Reset new key counters
-    #         for vnode in self.virtual_nodes.values():
-    #             with vnode.lock:
-    #                 vnode.new_keys_count = 0
-    #                 vnode.update_ready = False
-                    
-    #         logger.info(f"Model retrained with {len(sample_keys)} keys, "
-    #                    f"version {self.learned_hash.version}")
             
     def federated_model_update(self):
-        """Perform federated model update across virtual nodes"""
-        # Check if majority of virtual nodes are ready for update
-        ready_count = sum(1 for vnode in self.virtual_nodes.values() 
-                         if vnode.update_ready)
-        
-        if ready_count < len(self.virtual_nodes) * 0.9:
-            logger.debug(f"Not enough nodes ready for update ({ready_count}/{len(self.virtual_nodes)})")
+        """
+        Perform federated model update using FRM algorithm from LEAD paper.
+
+        Algorithm (Section III-E3):
+        1. Check if local node is ready (40% new keys threshold)
+        2. Check if 90% of neighbors are ready (via heartbeat status)
+        3. If both conditions met, become transient coordinator
+        4. Aggregate leaf parameters from neighbors via FedAvg
+        5. Broadcast new model version to network
+        """
+        # Update FRM with local training data from all virtual nodes
+        self._update_frm_from_local_vnodes()
+
+        # Check if we should trigger federated update
+        with self.neighbor_status_lock:
+            if not self.frm.should_trigger_federated_update(self.neighbor_ready_status):
+                status = self.frm.get_update_status()
+                logger.debug(f"Not ready for federated update: local_ready={status['local_ready']}, "
+                           f"neighbors_ready={status['neighbors_ready_percent']:.1%}")
+                return
+
+        # Start timing the update
+        update_start_time = time.time()
+
+        logger.info("Node becoming transient coordinator for federated update")
+
+        # Collect parameters from neighbors
+        neighbor_params = self._collect_neighbor_parameters()
+
+        if not neighbor_params:
+            logger.warning("No neighbor parameters collected, skipping federated update")
             return
-            
-        logger.info("Initiating federated model update")
-        
-        # Collect leaf model updates from local virtual nodes
+
+        # Count unique neighbors (excluding self)
+        total_neighbors = len(set(
+            p['sender_id'] for p in neighbor_params
+            if p['sender_id'] != f"{self.ip}:{self.base_port}"
+        ))
+
+        # Aggregate parameters using FedAvg
+        try:
+            self.frm.aggregate_leaf_parameters(neighbor_params)
+            logger.info(f"Aggregated parameters from {len(neighbor_params)} neighbors")
+        except Exception as e:
+            logger.error(f"Failed to aggregate parameters: {e}")
+            return
+
+        # Calculate bytes sent/received (approximate)
+        bytes_received = sum(
+            sum(len(p['coefficients']) * 8 for p in peer['leaf_parameters'])
+            for peer in neighbor_params
+        )
+
+        # Apply aggregated parameters to local model
+        try:
+            aggregated = self.frm.get_aggregated_parameters()
+            self._apply_frm_to_learned_hash(aggregated)
+
+            # Increment version
+            with self.learned_hash_lock:
+                self.learned_hash.version += 1
+
+            # Reset update flags on virtual nodes
+            for vnode in self.virtual_nodes.values():
+                with vnode.lock:
+                    vnode.new_keys_count = 0
+                    vnode.update_ready = False
+
+            logger.info(f"Federated model update complete, version {self.learned_hash.version}")
+
+            # Broadcast new model version to neighbors
+            bytes_sent = self._broadcast_model_to_neighbors(self.learned_hash.version, aggregated)
+
+            # Record metrics
+            update_latency_ms = (time.time() - update_start_time) * 1000
+            self.frm.metrics.record_update(
+                latency_ms=update_latency_ms,
+                coordinator=True,
+                peers_participated=len(neighbor_params),
+                total_peers=max(total_neighbors, 1),
+                bytes_sent=bytes_sent,
+                bytes_received=bytes_received
+            )
+
+            logger.info(f"FRM update metrics: latency={update_latency_ms:.1f}ms, "
+                       f"peers={len(neighbor_params)}, bytes_sent={bytes_sent}, "
+                       f"bytes_received={bytes_received}")
+
+        except Exception as e:
+            logger.error(f"Failed to apply federated update: {e}")
+
+    def _broadcast_model_to_neighbors(self, model_version: int,
+                                     leaf_parameters: List[LeafModelParameters]) -> int:
+        """Broadcast updated model to all neighbors.
+
+        Returns:
+            Total bytes sent (approximate)
+        """
+        # Get unique neighbor nodes
+        neighbor_nodes = set()
+        for vnode in self.virtual_nodes.values():
+            with vnode.lock:
+                if vnode.successor and vnode.successor.vid != vnode.vid:
+                    neighbor_nodes.add((vnode.successor.ip, vnode.successor.port))
+                if vnode.predecessor and vnode.predecessor.vid != vnode.vid:
+                    neighbor_nodes.add((vnode.predecessor.ip, vnode.predecessor.port))
+
+        # Calculate approximate bytes to send
+        bytes_per_broadcast = sum(len(p.coefficients) * 8 for p in leaf_parameters)
+
+        # Broadcast to each neighbor
+        success_count = 0
+        for ip, port in neighbor_nodes:
+            # Skip self
+            if ip == self.ip and port == self.base_port:
+                continue
+
+            if self.rpc_broadcast_model(ip, port, model_version, leaf_parameters):
+                success_count += 1
+                logger.debug(f"Broadcasted model v{model_version} to {ip}:{port}")
+
+        logger.info(f"Broadcasted model v{model_version} to {success_count}/{len(neighbor_nodes)} neighbors")
+
+        return bytes_per_broadcast * success_count
+
+    def _update_frm_from_local_vnodes(self):
+        """Update FRM with training data from local virtual nodes"""
+        # Collect leaf model updates from all local virtual nodes
         leaf_updates = defaultdict(list)
-        
+
         for vnode in self.virtual_nodes.values():
             with vnode.lock:
                 if not vnode.storage:
                     continue
-                    
-                # Get keys and their relative positions
+
+                # Get keys and their actual stored positions
                 sorted_keys = sorted(vnode.storage.keys())
-                
+
+                if not sorted_keys:
+                    continue
+
                 for idx, key in enumerate(sorted_keys):
                     # Predict which leaf model this key belongs to
                     normalized_key = key / self.hash_space_size
                     bucket_prediction = self.learned_hash.stage1_model.predict(normalized_key)
-                    bucket_id = int(np.clip(bucket_prediction, 0, 
+                    bucket_id = int(np.clip(bucket_prediction, 0,
                                            self.learned_hash.branching_factor - 1))
-                    
-                    # Calculate relative position for training
+
+                    # Calculate actual position in this vnode's storage
                     relative_pos = idx / len(sorted_keys)
                     leaf_updates[bucket_id].append((key, relative_pos))
-                    
-        # Update leaf models with aggregated data
-        with self.learned_hash_lock:
-            for bucket_id, key_pos_pairs in leaf_updates.items():
-                if len(key_pos_pairs) > 2:  # Need minimum data points
-                    keys = np.array([kp[0] for kp in key_pos_pairs])
-                    positions = np.array([kp[1] for kp in key_pos_pairs])
-                    self.learned_hash.update_leaf(bucket_id, keys, positions)
-                    
-            self.learned_hash.version += 1
-            
-        # Reset update flags
+
+        # Update FRM leaf models with collected data
+        for leaf_index, key_pos_pairs in leaf_updates.items():
+            if len(key_pos_pairs) > 2:  # Need minimum data points
+                keys = np.array([kp[0] for kp in key_pos_pairs])
+                positions = np.array([kp[1] for kp in key_pos_pairs])
+                self.frm.update_leaf_model(leaf_index, keys, positions)
+
+    def _collect_neighbor_parameters(self) -> List[Dict[str, Any]]:
+        """
+        Collect leaf parameters from neighbors.
+
+        Returns:
+            List of parameter dictionaries from neighbors
+        """
+        neighbor_params = []
+
+        # Get unique neighbor nodes from all virtual nodes
+        neighbor_nodes = set()
         for vnode in self.virtual_nodes.values():
             with vnode.lock:
-                vnode.new_keys_count = 0
-                vnode.update_ready = False
-                
-        logger.info(f"Federated model update complete, version {self.learned_hash.version}")
+                if vnode.successor and vnode.successor.vid != vnode.vid:
+                    neighbor_nodes.add((vnode.successor.ip, vnode.successor.port))
+                if vnode.predecessor and vnode.predecessor.vid != vnode.vid:
+                    neighbor_nodes.add((vnode.predecessor.ip, vnode.predecessor.port))
+
+        # Request parameters from each unique neighbor
+        for ip, port in neighbor_nodes:
+            # Skip self
+            if ip == self.ip and port == self.base_port:
+                continue
+
+            try:
+                params = self.rpc_get_frm_parameters(ip, port)
+                if params:
+                    neighbor_params.append(params)
+            except Exception as e:
+                logger.warning(f"Failed to get parameters from {ip}:{port}: {e}")
+
+        # Always include local parameters
+        local_params = {
+            'sender_id': f"{self.ip}:{self.base_port}",
+            'model_version': self.frm.model_version,
+            'leaf_parameters': [param.to_dict() for param in self.frm.get_leaf_parameters()],
+            'total_keys_trained': sum(param.num_samples for param in self.frm.get_leaf_parameters())
+        }
+        neighbor_params.append(local_params)
+
+        return neighbor_params
+
+    def _apply_frm_to_learned_hash(self, aggregated_params: List[LeafModelParameters]):
+        """
+        Apply FRM aggregated parameters to the learned hash RMI.
+
+        Args:
+            aggregated_params: List of aggregated leaf model parameters
+        """
+        with self.learned_hash_lock:
+            for param in aggregated_params:
+                # Update the corresponding leaf model in RMI (stage2_models)
+                if param.leaf_index < len(self.learned_hash.stage2_models):
+                    # Apply coefficients to leaf model
+                    leaf_model = self.learned_hash.stage2_models[param.leaf_index]
+                    leaf_model.coefficients = param.coefficients.copy()
+                    leaf_model.trained = True
+
+                    logger.debug(f"Updated leaf model {param.leaf_index} with FRM parameters "
+                               f"(version {param.version})")
         
     def get_stats(self) -> dict:
         """
@@ -701,6 +939,7 @@ class LEADNode:
             'model_version': self.learned_hash.version,
             'running': self.running,
             'ready': self.ready,
+            'frm_metrics': self.frm.metrics.to_dict(),
             'virtual_nodes': vnode_stats
         }
         
@@ -817,6 +1056,52 @@ class LEADNode:
             # Store transferred keys locally
             for key, value in keys:
                 self.put(key, value)
+
+    def rpc_get_frm_parameters(self, ip: str, port: int) -> Optional[Dict[str, Any]]:
+        """RPC: Get FRM leaf parameters from neighbor"""
+        try:
+            response = self._send_rpc(ip, port, 'get_frm_parameters', {})
+            if response.get('success'):
+                return {
+                    'sender_id': response['sender_id'],
+                    'model_version': response['model_version'],
+                    'leaf_parameters': response['leaf_parameters'],
+                    'total_keys_trained': response['total_keys_trained']
+                }
+        except Exception as e:
+            logger.warning(f"Failed to get FRM parameters from {ip}:{port}: {e}")
+        return None
+
+    def rpc_heartbeat(self, ip: str, port: int) -> Optional[Dict[str, Any]]:
+        """RPC: Send heartbeat to neighbor and get their status"""
+        try:
+            payload = {
+                'sender_id': f"{self.ip}:{self.base_port}",
+                'update_ready': self.frm.local_ready
+            }
+            response = self._send_rpc(ip, port, 'heartbeat', payload)
+            if response.get('success'):
+                return {
+                    'update_ready': response.get('update_ready', False),
+                    'model_version': response.get('model_version', 0)
+                }
+        except Exception as e:
+            logger.debug(f"Heartbeat to {ip}:{port} failed: {e}")
+        return None
+
+    def rpc_broadcast_model(self, ip: str, port: int, model_version: int,
+                           leaf_parameters: List[LeafModelParameters]) -> bool:
+        """RPC: Broadcast updated model to neighbor"""
+        try:
+            payload = {
+                'model_version': model_version,
+                'leaf_parameters': [param.to_dict() for param in leaf_parameters]
+            }
+            response = self._send_rpc(ip, port, 'broadcast_model', payload)
+            return response.get('success', False) and response.get('applied', False)
+        except Exception as e:
+            logger.warning(f"Failed to broadcast model to {ip}:{port}: {e}")
+            return False
 
     def get_nodes_for_tip_range(self, hash_min: int, hash_max: int) -> List[Dict[str, Any]]:
         """
@@ -958,7 +1243,7 @@ class LEADNode:
         Execute a TIP range query and return routing information.
 
         This returns information about which nodes to query, but does NOT
-        execute the actual PostgreSQL queries (that's done at a higher level).
+        execute the actual data retrieval (that's done at a higher level).
 
         Args:
             hash_min: Minimum hash value from TIP range
@@ -1001,17 +1286,17 @@ class LEADNode:
         }
 
     def update_routing_metadata(self, tip_hash: int, entity_id: str,
-                                postgres_node: str, metadata: Optional[Dict] = None):
+                                storage_node: str, metadata: Optional[Dict] = None):
         """
         Update routing table with metadata from CDC events.
 
-        This is called by the CDC consumer when entities are written to PostgreSQL.
+        This is called by the CDC consumer when entities are written to a physical node.
         The DLHT uses this lightweight metadata to route queries efficiently.
 
         Args:
             tip_hash: Hash of the TIP tag
             entity_id: ID of the entity
-            postgres_node: Which PostgreSQL shard/schema has this entity
+            storage_node: Which storage node/shard has this entity
             metadata: Optional additional metadata (timestamp, size, etc.)
         """
         with self.routing_table_lock:
@@ -1028,7 +1313,7 @@ class LEADNode:
 
             entry = {
                 'entity_id': entity_id,
-                'postgres_node': postgres_node,
+                'storage_node': storage_node,
                 'metadata': metadata or {},
                 'updated_at': time.time()
             }
@@ -1043,15 +1328,15 @@ class LEADNode:
                 # Track new key insertion for adaptive training
                 self.training_manager.on_key_inserted(float(tip_hash))
 
-        logger.debug(f"Updated routing: tip_hash={tip_hash} → {postgres_node} (entity: {entity_id})")
+        logger.debug(f"Updated routing: tip_hash={tip_hash} → {storage_node} (entity: {entity_id})")
 
     def query_routing_table_for_range(self, hash_min: int, hash_max: int) -> Dict[str, Any]:
         """
-        Query the CDC routing table to find which PostgreSQL nodes have data
+        Query the CDC routing table to find which storage nodes have data
         in the given hash range.
 
         This is the key method for intelligent query routing - it uses the routing
-        table (populated by CDC) to determine which PostgreSQL nodes actually contain
+        table (populated by CDC) to determine which storage nodes actually contain
         relevant data, avoiding unnecessary queries to nodes without matching data.
 
         Args:
@@ -1060,13 +1345,13 @@ class LEADNode:
 
         Returns:
             Dict with:
-            - postgres_nodes: Set of postgres node names that have data in range
+            - storage_nodes: Set of storage node names that have data in range
             - matching_hashes: List of hashes in range
             - total_matches: Number of entities found
         """
         with self.routing_table_lock:
             matching_hashes = []
-            postgres_nodes = set()
+            storage_nodes = set()
             total_entities = 0
 
             # Scan routing table for hashes in range
@@ -1075,13 +1360,13 @@ class LEADNode:
                     matching_hashes.append(tip_hash)
                     # Each hash can have multiple entities
                     for entity in entity_list:
-                        postgres_nodes.add(entity['postgres_node'])
+                        storage_nodes.add(entity['storage_node'])
                         total_entities += 1
 
-            logger.info(f"Routing table scan: found {total_entities} entities ({len(matching_hashes)} unique hashes) across {len(postgres_nodes)} PostgreSQL nodes")
+            logger.info(f"Routing table scan: found {total_entities} entities ({len(matching_hashes)} unique hashes) across {len(storage_nodes)} storage nodes")
 
             return {
-                'postgres_nodes': list(postgres_nodes),
+                'storage_nodes': list(storage_nodes),
                 'matching_hashes': matching_hashes,
                 'total_matches': total_entities,
                 'hash_range': (hash_min, hash_max)
@@ -1092,7 +1377,7 @@ class LEADNode:
         Get routing information for a specific TIP hash.
 
         Returns:
-            List of dicts with postgres_node and metadata for all entities with this hash,
+            List of dicts with storage_node and metadata for all entities with this hash,
             or None if not found
         """
         with self.routing_table_lock:
@@ -1103,17 +1388,17 @@ class LEADNode:
         Get statistics about the routing table.
 
         Returns:
-            Stats including size, distribution across postgres nodes, etc.
+            Stats including size, distribution across storage nodes, etc.
         """
         with self.routing_table_lock:
             total_hashes = len(self.routing_table)
             total_entities = 0
 
-            # Count entities per postgres node
+            # Count entities per storage node
             node_distribution = defaultdict(int)
             for entity_list in self.routing_table.values():
                 for entity in entity_list:
-                    node_distribution[entity['postgres_node']] += 1
+                    node_distribution[entity['storage_node']] += 1
                     total_entities += 1
 
             return {
