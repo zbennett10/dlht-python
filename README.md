@@ -332,7 +332,3 @@ MIT License - see [LICENSE](LICENSE) for details.
 - [FedAvg: Communication-Efficient Learning](https://arxiv.org/abs/1602.05629) - McMahan et al., 2017
 
 ## Support
-
-- Documentation: https://dlht-python.readthedocs.io
-- Issues: https://github.com/coti-io/dlht-python/issues
-- Discussions: https://github.com/coti-io/dlht-python/discussions
