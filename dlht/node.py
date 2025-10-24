@@ -712,8 +712,8 @@ class LEADNode:
         with self.neighbor_status_lock:
             if not self.frm.should_trigger_federated_update(self.neighbor_ready_status):
                 status = self.frm.get_update_status()
-                logger.debug(f"Not ready for federated update: local_ready={status['local_ready']}, "
-                           f"neighbors_ready={status['neighbors_ready_percent']:.1%}")
+                logger.debug(f"Not ready for federated update: local_ready={status['ready_for_update']}, "
+                           f"neighbors_ready={status['neighbor_ready_proportion']:.1%}")
                 return
 
         # Start timing the update

@@ -84,9 +84,12 @@ class LEADPeer:
                 
             # Forward to closest preceding node
             closest = self.closest_preceding_node(key_hash)
-            if closest.vid == self.vid:
+
+            # If closest node is self, return successor (avoid self-RPC)
+            if closest.vid == self.vid or \
+               (closest.ip == self.ip and closest.port == self.port):
                 return self.successor
-                
+
             # RPC to closest node
             return self.physical_node.rpc_find_successor(closest.ip, closest.port, key_hash)
             
@@ -126,6 +129,11 @@ class LEADPeer:
             if self.successor is None:
                 return
 
+            # Skip stabilization if successor is self
+            if self.successor.vid == self.vid or \
+               (self.successor.ip == self.ip and self.successor.port == self.port):
+                return
+
             # Ask successor for its predecessor
             try:
                 x = self.physical_node.rpc_get_predecessor(
@@ -134,10 +142,12 @@ class LEADPeer:
                 if x is not None and self.in_range(x.vid, self.vid, self.successor.vid):
                     self.successor = x
 
-                # Notify successor
-                self.physical_node.rpc_notify(
-                    self.successor.ip, self.successor.port,
-                    FingerEntry(self.vid, self.ip, self.port))
+                # Notify successor (skip if successor is now self)
+                if self.successor.vid != self.vid and \
+                   not (self.successor.ip == self.ip and self.successor.port == self.port):
+                    self.physical_node.rpc_notify(
+                        self.successor.ip, self.successor.port,
+                        FingerEntry(self.vid, self.ip, self.port))
 
                 # Update successor list
                 self.update_successor_list()
